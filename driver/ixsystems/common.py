@@ -419,11 +419,15 @@ class FreeNASCommon:
         return None
 
     def _create_iscsi_target(self, target_name):
-        """Create an iSCSI target on TrueNAS."""
+        """Create an iSCSI target on TrueNAS.
+
+        TrueNAS CORE 13 treats alias='' as a value and enforces uniqueness —
+        sending alias='' for every target causes HTTP 422 'Alias already exists'
+        after the first target. Omit alias entirely so TrueNAS assigns null.
+        """
         LOG.info('iXsystems: creating iSCSI target %s', target_name)
         params = {
             'name': target_name,
-            'alias': '',
             'mode': 'ISCSI',
             'groups': [],
         }
