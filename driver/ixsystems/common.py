@@ -276,7 +276,7 @@ class FreeNASCommon:
             'free_capacity_gb': round(free_gb, 2),
             'reserved_percentage': 0,
             'QoS_support': False,
-            'multiattach': False,
+            'multiattach': True,
         }
 
         LOG.info(

@@ -12,8 +12,8 @@
 #   - except X as e  (was except X, e)
 #   - f-strings throughout
 #   - Delegates all TrueNAS logic to self.common (FreeNASCommon)
-#   - Added create_export / ensure_export / remove_export (were missing,
-#     causing NotImplementedError on delete_volume)
+#   - Added create_export / ensure_export / remove_export (no-ops)
+#   - Multi-attach: terminate_connection only tears down target on last detach
 
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -40,7 +40,8 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
         2.0.0 - TrueNAS 12.x, Python 3 migration attempt
         3.0.0 - Full Python 3.9 migration; API v2.0; robust JSON handling;
                 urllib.request replacing urllib2; stdlib json replacing simplejson;
-                added create_export/ensure_export/remove_export no-ops
+                added create_export/ensure_export/remove_export no-ops;
+                multi-attach support with safe terminate_connection
     """
 
     VERSION = '3.0.0'
@@ -116,15 +117,7 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
     #                                                                      #
     # For TrueNAS iSCSI the target/extent lifecycle is fully managed via  #
     # the TrueNAS REST API in initialize_connection/terminate_connection.  #
-    # These Cinder export hooks are therefore deliberate no-ops — they    #
-    # must exist to satisfy the abstract interface contract but there is   #
-    # nothing to do here at the OS/config-file level.                     #
-    #                                                                      #
-    # WHY THIS MATTERS:                                                    #
-    # Cinder's delete_volume() flow is:                                   #
-    #   1. remove_export(context, volume)   ← was raising NotImplementedError
-    #   2. driver.delete_volume(volume)                                    #
-    # Without all three methods the delete flow aborts immediately.        #
+    # These Cinder export hooks are deliberate no-ops.                    #
     # ------------------------------------------------------------------ #
 
     def create_export(self, context, volume, connector):
@@ -141,9 +134,8 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
         No-op: TrueNAS target/extent teardown happens in terminate_connection.
 
         Cinder calls remove_export() during delete_volume() to clean up any
-        persistent iSCSI export (e.g. tgt/lio config files on a local host).
-        For TrueNAS we manage targets entirely via REST API calls in
-        terminate_connection(), so there is nothing to clean up here.
+        persistent iSCSI export. For TrueNAS we manage targets entirely via
+        REST API calls in terminate_connection(), so nothing to do here.
         """
         LOG.debug('iXsystems: remove_export (no-op) for %s', volume.name)
 
@@ -152,6 +144,16 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
     # ------------------------------------------------------------------ #
 
     def initialize_connection(self, volume, connector):
+        """
+        Attach volume to an initiator.
+
+        Creates the iSCSI target + extent on TrueNAS (or reuses existing ones
+        for multi-attach volumes) and returns the connection properties that
+        Nova/os-brick uses to perform the iSCSI login on the compute node.
+
+        For multi-attach volumes this is called once per VM — the same iSCSI
+        target is reused; only the LUN mapping is idempotent.
+        """
         LOG.info('iXsystems: initialize_connection %s initiator=%s',
                  volume.name, connector.get('initiator'))
 
@@ -175,10 +177,68 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
             'target_lun': lun_id,
             'access_mode': 'rw',
         }
+
+        LOG.info('iXsystems: connection properties for %s: iqn=%s portal=%s lun=%s',
+                 volume.name, iqn, portal, lun_id)
         return {'driver_volume_type': 'iscsi', 'data': properties}
 
     def terminate_connection(self, volume, connector, **kwargs):
-        LOG.info('iXsystems: terminate_connection %s', volume.name)
+        """
+        Detach a volume from an initiator.
+
+        Multi-attach aware: only tears down the iSCSI target and extent on
+        TrueNAS when this is the LAST remaining attachment. If other VMs still
+        have the volume attached the target is kept alive.
+
+        The connector is None when Cinder forces a detach (e.g. during volume
+        deletion or when a compute node is lost). In that case we always tear
+        down regardless of remaining attachment count.
+        """
+        LOG.info('iXsystems: terminate_connection %s connector=%s',
+                 volume.name, connector)
+
+        # Force-detach path (connector is None): always clean up
+        if connector is None:
+            LOG.info(
+                'iXsystems: force detach for %s — removing target unconditionally',
+                volume.name
+            )
+            self.common._remove_target_and_extent(volume.name)
+            return
+
+        # Multi-attach check: count attachments that are NOT this connector.
+        # volume.volume_attachment is a list of VolumeAttachment objects.
+        # Each has a .connector dict identifying the attached host.
+        try:
+            all_attachments = volume.volume_attachment
+            remaining = [
+                att for att in all_attachments
+                if att.connector and att.connector != connector
+            ]
+            remaining_count = len(remaining)
+        except Exception as e:
+            # If we can't determine attachment count, be safe and keep target
+            LOG.warning(
+                'iXsystems: could not determine remaining attachments for %s '
+                '(%s) — keeping target intact to be safe',
+                volume.name, e
+            )
+            return
+
+        if remaining_count > 0:
+            LOG.info(
+                'iXsystems: %s still has %d active attachment(s) after this '
+                'detach — keeping iSCSI target intact on TrueNAS',
+                volume.name, remaining_count
+            )
+            return
+
+        # This is the last attachment — safe to remove target and extent
+        LOG.info(
+            'iXsystems: last attachment removed for %s — '
+            'tearing down iSCSI target and extent on TrueNAS',
+            volume.name
+        )
         self.common._remove_target_and_extent(volume.name)
 
     # ------------------------------------------------------------------ #
