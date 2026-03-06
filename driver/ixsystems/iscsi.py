@@ -12,6 +12,8 @@
 #   - except X as e  (was except X, e)
 #   - f-strings throughout
 #   - Delegates all TrueNAS logic to self.common (FreeNASCommon)
+#   - Added create_export / ensure_export / remove_export (were missing,
+#     causing NotImplementedError on delete_volume)
 
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -37,7 +39,8 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
         1.0.0 - Initial FreeNAS driver (Python 2.7, API v1)
         2.0.0 - TrueNAS 12.x, Python 3 migration attempt
         3.0.0 - Full Python 3.9 migration; API v2.0; robust JSON handling;
-                urllib.request replacing urllib2; stdlib json replacing simplejson
+                urllib.request replacing urllib2; stdlib json replacing simplejson;
+                added create_export/ensure_export/remove_export no-ops
     """
 
     VERSION = '3.0.0'
@@ -107,6 +110,42 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
         LOG.info('iXsystems: create_cloned_volume %s from %s',
                  volume.name, src_vref.name)
         self.common._create_cloned_volume(volume.name, src_vref.name, volume.size)
+
+    # ------------------------------------------------------------------ #
+    # Export methods — required by Cinder ISCSIDriver base class          #
+    #                                                                      #
+    # For TrueNAS iSCSI the target/extent lifecycle is fully managed via  #
+    # the TrueNAS REST API in initialize_connection/terminate_connection.  #
+    # These Cinder export hooks are therefore deliberate no-ops — they    #
+    # must exist to satisfy the abstract interface contract but there is   #
+    # nothing to do here at the OS/config-file level.                     #
+    #                                                                      #
+    # WHY THIS MATTERS:                                                    #
+    # Cinder's delete_volume() flow is:                                   #
+    #   1. remove_export(context, volume)   ← was raising NotImplementedError
+    #   2. driver.delete_volume(volume)                                    #
+    # Without all three methods the delete flow aborts immediately.        #
+    # ------------------------------------------------------------------ #
+
+    def create_export(self, context, volume, connector):
+        """No-op: TrueNAS targets are created on-demand in initialize_connection."""
+        LOG.debug('iXsystems: create_export (no-op) for %s', volume.name)
+        return {}
+
+    def ensure_export(self, context, volume):
+        """No-op: TrueNAS targets are verified on-demand in initialize_connection."""
+        LOG.debug('iXsystems: ensure_export (no-op) for %s', volume.name)
+
+    def remove_export(self, context, volume):
+        """
+        No-op: TrueNAS target/extent teardown happens in terminate_connection.
+
+        Cinder calls remove_export() during delete_volume() to clean up any
+        persistent iSCSI export (e.g. tgt/lio config files on a local host).
+        For TrueNAS we manage targets entirely via REST API calls in
+        terminate_connection(), so there is nothing to clean up here.
+        """
+        LOG.debug('iXsystems: remove_export (no-op) for %s', volume.name)
 
     # ------------------------------------------------------------------ #
     # iSCSI attachment                                                     #
