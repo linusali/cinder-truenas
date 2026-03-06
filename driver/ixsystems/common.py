@@ -180,21 +180,69 @@ class FreeNASCommon:
             return 0, 0
 
         if pool is None:
-            LOG.warning('Pool "%s" not found in TrueNAS response', pool_name)
+            LOG.warning(
+                'Pool "%s" not found in TrueNAS response. Available: %s',
+                pool_name,
+                [p.get('name') for p in response]
+                if isinstance(response, list) else 'N/A'
+            )
             return 0, 0
 
-        # TrueNAS v2.0 exposes free/size as bytes on the pool topology
-        # Keys differ between CORE and SCALE and API versions:
-        #   SCALE: pool['free'], pool['size']
-        #   CORE:  pool['avail'], pool['used']
-        free_bytes = pool.get('free', pool.get('avail', 0))
-        size_bytes = pool.get('size', None)
+        LOG.debug('TrueNAS raw pool object: %s', pool)
 
-        if size_bytes is None:
-            used_bytes = pool.get('used', 0)
-            size_bytes = free_bytes + used_bytes
+        # ----------------------------------------------------------------
+        # Capacity extraction — TrueNAS CORE (this API version) does NOT
+        # expose free/size at the top level of the pool object.
+        #
+        # Actual structure (confirmed from API response):
+        #   pool['topology']['data'][0]['stats']['size']       ← total bytes
+        #   pool['topology']['data'][0]['stats']['allocated']  ← used bytes
+        #   free = size - allocated
+        #
+        # TrueNAS SCALE newer versions may expose top-level 'free'/'size'
+        # so we try that first and fall back to topology.
+        # ----------------------------------------------------------------
 
-        return int(free_bytes), int(size_bytes)
+        # Strategy 1: top-level keys (TrueNAS SCALE newer builds)
+        size_bytes = pool.get('size') or pool.get('total') or None
+        free_bytes = pool.get('free') or pool.get('avail') or None
+
+        if size_bytes and free_bytes:
+            LOG.debug(
+                'iXsystems: capacity from top-level keys: '
+                'size=%s free=%s', size_bytes, free_bytes
+            )
+            return int(free_bytes), int(size_bytes)
+
+        # Strategy 2: topology.data[0].stats (TrueNAS CORE / this version)
+        try:
+            topology_data = pool.get('topology', {}).get('data', [])
+            if topology_data:
+                stats = topology_data[0].get('stats', {})
+                size_bytes = stats.get('size', 0)
+                allocated_bytes = stats.get('allocated', 0)
+                free_bytes = size_bytes - allocated_bytes
+                LOG.debug(
+                    'iXsystems: capacity from topology.data[0].stats: '
+                    'size=%s allocated=%s free=%s',
+                    size_bytes, allocated_bytes, free_bytes
+                )
+                if size_bytes > 0:
+                    return int(free_bytes), int(size_bytes)
+        except (IndexError, KeyError, TypeError) as e:
+            LOG.warning('iXsystems: failed to parse topology stats: %s', e)
+
+        # Strategy 3: top-level allocated/used fallback
+        allocated = pool.get('allocated') or pool.get('used') or 0
+        if size_bytes and allocated:
+            free_bytes = size_bytes - allocated
+            return int(free_bytes), int(size_bytes)
+
+        LOG.warning(
+            'iXsystems: could not extract capacity from pool "%s". '
+            'Pool keys: %s', pool_name, list(pool.keys())
+        )
+        return 0, 0
 
     def _update_volume_stats(self):
         """
