@@ -15,7 +15,15 @@
 #   - except X, e  → except X as e
 #   - base64 encode/decode explicitly (bytes vs str)
 #   - super()      → super() no args
-#   - String .encode('utf-8') for HTTP body bytes
+#   - encode/decode bytes explicitly for HTTP body
+#
+# TrueNAS CORE 13 fix:
+#   - DELETE endpoints do NOT accept a JSON body for boolean flags like
+#     'force' or 'remove' — they return HTTP 422 "Not a boolean" if you
+#     send them as JSON. These must be passed as URL query string params.
+#   - invoke_command() now accepts a separate `query_params` dict that is
+#     always appended to the URL as a query string, regardless of method.
+#   - For DELETE calls, callers should use query_params instead of params.
 
 import base64
 import json
@@ -77,7 +85,6 @@ class FreeNASServer:
 
     def _build_auth_header(self):
         """Return the Authorization header value."""
-        # API key takes precedence over username/password
         if self.apikey:
             return f'Bearer {self.apikey}'
         if self.username and self.password:
@@ -87,30 +94,34 @@ class FreeNASServer:
         return None
 
     def _get_ssl_context(self):
-        """
-        Return an unverified SSL context for self-signed certificates.
-
-        In production, pass a verified context or set verify=True via config.
-        """
+        """Return an unverified SSL context for self-signed certificates."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
-    def invoke_command(self, method, path, params=None):
+    def invoke_command(self, method, path, params=None, query_params=None):
         """
         Make an HTTP request to the TrueNAS API.
 
-        :param method: 'GET', 'POST', 'PUT', 'DELETE'
-        :param path:   full path, e.g. '/api/v2.0/pool'
-        :param params: dict payload for POST/PUT (JSON-encoded)
+        :param method:       'GET', 'POST', 'PUT', 'DELETE'
+        :param path:         API path, e.g. '/api/v2.0/pool'
+        :param params:       dict payload encoded as JSON body (POST/PUT only)
+        :param query_params: dict appended to URL as query string.
+                             Use this for DELETE boolean flags on TrueNAS CORE 13
+                             (e.g. force=true, remove=true) because CORE 13
+                             rejects these as a JSON body with HTTP 422.
         :returns: {'code': <int>, 'response': <str>}
-        :raises FreeNASApiError: on connection/HTTP errors
+        :raises FreeNASApiError: on HTTP or connection errors
         """
+        # Build URL — append query_params as query string if provided
         url = f'{self._base_url}{path}'
+        if query_params:
+            url = f'{url}?{urllib.parse.urlencode(query_params)}'
 
+        # Build body — only for POST/PUT, never for GET/DELETE
         body = None
-        if params is not None:
+        if params is not None and method in ('POST', 'PUT', 'PATCH'):
             body = json.dumps(params).encode('utf-8')
 
         req = urllib.request.Request(url, data=body, method=method)
@@ -134,7 +145,7 @@ class FreeNASServer:
             body_bytes = resp.read()
             body_str = body_bytes.decode('utf-8') if body_bytes else ''
 
-            LOG.debug('FreeNASServer: HTTP %s ← %s %s', status, method, path)
+            LOG.debug('FreeNASServer: HTTP %s <- %s %s', status, method, path)
             return {'code': status, 'response': body_str}
 
         except urllib.error.HTTPError as e:
@@ -144,11 +155,9 @@ class FreeNASServer:
                 'FreeNASServer: HTTP %s error for %s %s: %s',
                 e.code, method, path, body_str
             )
-            # Return the error code and body so callers can inspect if needed,
-            # but also raise so common.py knows it failed.
             raise FreeNASApiError(
                 f'HTTP {e.code}',
-                f'{method} {path} → {body_str[:200]}'
+                f'{method} {path} -> {body_str[:200]}'
             ) from e
 
         except urllib.error.URLError as e:
@@ -158,5 +167,5 @@ class FreeNASServer:
             )
             raise FreeNASApiError(
                 'Connection error',
-                f'{method} {path} → {e.reason}'
+                f'{method} {path} -> {e.reason}'
             ) from e

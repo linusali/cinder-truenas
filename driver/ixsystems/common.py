@@ -85,7 +85,7 @@ class FreeNASCommon:
             )
         return self.handle
 
-    def _execute_request(self, path, method='GET', params=None):
+    def _execute_request(self, path, method='GET', params=None, query_params=None):
         """
         Execute a REST call and return the parsed JSON body.
 
@@ -97,7 +97,7 @@ class FreeNASCommon:
         """
         server = self._get_server_handle()
         try:
-            ret = server.invoke_command(method, path, params)
+            ret = server.invoke_command(method, path, params, query_params)
         except FreeNASApiError as e:
             raise exception.VolumeBackendAPIException(data=str(e)) from e
 
@@ -435,12 +435,16 @@ class FreeNASCommon:
         return result
 
     def _delete_iscsi_target(self, target_id):
-        """Delete an iSCSI target."""
+        """Delete an iSCSI target.
+
+        TrueNAS CORE 13 requires 'force' as a URL query parameter, NOT a
+        JSON body -- sending it as JSON body returns HTTP 422 'Not a boolean'.
+        """
         LOG.info('iXsystems: deleting iSCSI target id=%s', target_id)
         self._execute_request(
             f'/api/v2.0/iscsi/target/id/{target_id}',
             'DELETE',
-            {'force': True}
+            query_params={'force': 'true'}
         )
 
     def _get_iscsi_extent(self, extent_name):
@@ -474,10 +478,11 @@ class FreeNASCommon:
     def _delete_iscsi_extent(self, extent_id):
         """Delete an iSCSI extent."""
         LOG.info('iXsystems: deleting iSCSI extent id=%s', extent_id)
+        # TrueNAS CORE 13: 'remove' must be a query param, not a JSON body
         self._execute_request(
             f'/api/v2.0/iscsi/extent/id/{extent_id}',
             'DELETE',
-            {'remove': True}
+            query_params={'remove': 'true'}
         )
 
     def _get_iscsi_targetextent(self, target_id, extent_id):
