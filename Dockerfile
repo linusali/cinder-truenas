@@ -8,7 +8,7 @@ FROM $LISTENING_IP_ADDRESS:8787/tripleo$RELEASE/centos-binary-cinder-volume:$CON
 # switch to root and install a custom RPM, etc.
 USER root
 RUN git clone --depth=1 https://github.com/iXsystems/cinder /tmp/cinder
-RUN cp -R /tmp/cinder/driver/ixsystems /usr/lib/python2.7/site-packages/cinder/volume/drivers/ 
+RUN cp -R /tmp/cinder/driver/ixsystems /usr/lib/python3.9/site-packages/cinder/volume/drivers/ 
 
 # switch the container back to the default user
 USER cinder
