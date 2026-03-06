@@ -1,14 +1,16 @@
-############################################################################
-# To use this code with Tripleo, the container must be modified as follows #
-# Please edit the release and tag variables to match your enviroment       #
-# See http://tripleo.org/install/containers_deployment/3rd_party.html      #
-############################################################################
-FROM $LISTENING_IP_ADDRESS:8787/tripleo$RELEASE/centos-binary-cinder-volume:$CONTAINERTAG
+FROM registry.redhat.io/rhoso/openstack-cinder-volume-rhel9:18.0
 
-# switch to root and install a custom RPM, etc.
 USER root
-RUN git clone --depth=1 https://github.com/iXsystems/cinder /tmp/cinder
-RUN cp -R /tmp/cinder/driver/ixsystems /usr/lib/python3.9/site-packages/cinder/volume/drivers/ 
 
-# switch the container back to the default user
+# Find the correct site-packages path at build time and copy there
+RUN PYPATH=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+    echo "Installing to: $PYPATH" && \
+    mkdir -p $PYPATH/cinder/volume/drivers/ixsystems
+
+COPY driver/ixsystems/ /tmp/ixsystems/
+
+RUN PYPATH=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+    cp -R /tmp/ixsystems/. $PYPATH/cinder/volume/drivers/ixsystems/ && \
+    rm -rf /tmp/ixsystems
+
 USER cinder
