@@ -176,6 +176,7 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
             'volume_id': volume.id,
             'target_lun': lun_id,
             'access_mode': 'rw',
+            'shared_targets': True,
         }
 
         LOG.info('iXsystems: connection properties for %s: iqn=%s portal=%s lun=%s',
