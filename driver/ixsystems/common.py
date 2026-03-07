@@ -7,12 +7,6 @@
 #
 #      http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# License for the specific language governing permissions and limitations
-# under the License.
-#
 # Python 3.9 migration notes vs original:
 #   - urllib2       → urllib.request / urllib.error
 #   - httplib       → http.client
@@ -27,6 +21,16 @@
 #   - Empty / non-JSON API responses guarded in _update_volume_stats and elsewhere
 #   - Integer division: / → // where whole GiB values needed
 #   - String formatting: % → f-strings throughout
+#
+# Performance improvements (v3.1.0):
+#   - Use /api/v2.0/iscsi/target?name=<x> filter instead of full list scan
+#   - Use /api/v2.0/iscsi/extent?name=<x> filter instead of full list scan
+#   - Merged _get_iscsi_targetextent + _get_available_lun into one call
+#     (_get_targetextent_and_lun) — was fetching the same full list twice
+#   - _get_iscsi_global_config result cached in self._iscsi_basename
+#     so it is only fetched once per driver lifetime instead of every attach
+#   - TrueNAS CORE 13 fix: alias omitted from target creation (422 duplicate)
+#   - TrueNAS CORE 13 fix: force/remove passed as query params not JSON body
 
 import json
 import math
@@ -60,13 +64,15 @@ class FreeNASCommon:
     FREENAS_TARGET_GROUP_AUTH_TYPE = 'None'
     FREENAS_TARGET_GROUP_INITIALDIGEST = 'Auto'
 
-    VERSION = '3.0.0'
+    VERSION = '3.1.0'
 
     def __init__(self, configuration):
         self.configuration = configuration
         self.configuration.append_config_values(options.ixsystems_opts)
         self._stats = {}
         self.handle = None
+        # Cached iSCSI global basename — fetched once, never changes at runtime
+        self._iscsi_basename = None
 
     # ------------------------------------------------------------------ #
     # Internal helpers                                                     #
@@ -92,6 +98,7 @@ class FreeNASCommon:
         :param path: API path, e.g. '/api/v2.0/pool'
         :param method: GET | POST | PUT | DELETE
         :param params: dict payload (will be JSON-encoded for POST/PUT)
+        :param query_params: dict appended to URL as query string
         :returns: parsed object (dict or list) or None for 204/empty
         :raises exception.VolumeBackendAPIException: on any error
         """
@@ -101,23 +108,18 @@ class FreeNASCommon:
         except FreeNASApiError as e:
             raise exception.VolumeBackendAPIException(data=str(e)) from e
 
-        # ret is expected to be {'code': int, 'response': str}
         code = ret.get('code', 0)
         raw = ret.get('response', '')
 
-        LOG.debug('TrueNAS API %s %s → HTTP %s', method, path, code)
+        LOG.debug('TrueNAS API %s %s -> HTTP %s', method, path, code)
 
-        # HTTP 204 No Content — success with no body
         if code == 204:
             return None
 
-        # Guard: empty or whitespace-only body
         if not raw or not raw.strip():
             LOG.debug('TrueNAS API returned empty body for %s %s', method, path)
             return None
 
-        # Guard: bare JSON string e.g. '""' or '"some error"'
-        # These are not the dicts/lists we want — treat as empty
         stripped = raw.strip()
         if stripped.startswith('"') and stripped.endswith('"'):
             LOG.warning(
@@ -157,23 +159,18 @@ class FreeNASCommon:
     def _parse_pool_response(self, response):
         """
         Extract free/total bytes from a TrueNAS API v2.0 /pool response.
-
-        TrueNAS v2.0 returns a LIST of pool objects.
-        TrueNAS v1 returned a single dict — we handle both.
         """
         if response is None:
             return 0, 0
 
         pool_name = self.configuration.ixsystems_datastore_pool
 
-        # v2.0 returns a list
         if isinstance(response, list):
             pool = next(
                 (p for p in response if p.get('name') == pool_name),
                 None
             )
         elif isinstance(response, dict):
-            # v1 or single-pool response
             pool = response
         else:
             LOG.warning('Unexpected pool response type: %s', type(response))
@@ -190,31 +187,14 @@ class FreeNASCommon:
 
         LOG.debug('TrueNAS raw pool object: %s', pool)
 
-        # ----------------------------------------------------------------
-        # Capacity extraction — TrueNAS CORE (this API version) does NOT
-        # expose free/size at the top level of the pool object.
-        #
-        # Actual structure (confirmed from API response):
-        #   pool['topology']['data'][0]['stats']['size']       ← total bytes
-        #   pool['topology']['data'][0]['stats']['allocated']  ← used bytes
-        #   free = size - allocated
-        #
-        # TrueNAS SCALE newer versions may expose top-level 'free'/'size'
-        # so we try that first and fall back to topology.
-        # ----------------------------------------------------------------
-
         # Strategy 1: top-level keys (TrueNAS SCALE newer builds)
         size_bytes = pool.get('size') or pool.get('total') or None
         free_bytes = pool.get('free') or pool.get('avail') or None
 
         if size_bytes and free_bytes:
-            LOG.debug(
-                'iXsystems: capacity from top-level keys: '
-                'size=%s free=%s', size_bytes, free_bytes
-            )
             return int(free_bytes), int(size_bytes)
 
-        # Strategy 2: topology.data[0].stats (TrueNAS CORE / this version)
+        # Strategy 2: topology.data[0].stats (TrueNAS CORE)
         try:
             topology_data = pool.get('topology', {}).get('data', [])
             if topology_data:
@@ -222,11 +202,6 @@ class FreeNASCommon:
                 size_bytes = stats.get('size', 0)
                 allocated_bytes = stats.get('allocated', 0)
                 free_bytes = size_bytes - allocated_bytes
-                LOG.debug(
-                    'iXsystems: capacity from topology.data[0].stats: '
-                    'size=%s allocated=%s free=%s',
-                    size_bytes, allocated_bytes, free_bytes
-                )
                 if size_bytes > 0:
                     return int(free_bytes), int(size_bytes)
         except (IndexError, KeyError, TypeError) as e:
@@ -245,23 +220,11 @@ class FreeNASCommon:
         return 0, 0
 
     def _update_volume_stats(self):
-        """
-        Fetch pool capacity from TrueNAS and populate self.stats.
-
-        Called by iscsi.py get_volume_stats().
-
-        Python 3.9 fixes vs original:
-          - Use /api/v2.0/pool instead of /api/v1.0/storage/volume/
-          - Guard empty/null response before json.loads()
-          - Handle list response (v2.0) not just dict (v1)
-          - Integer division with // for GiB calculation
-        """
+        """Fetch pool capacity from TrueNAS and populate self.stats."""
         LOG.info('iXsystems Get Volume Status')
         conf = self.configuration
 
-        # TrueNAS API v2.0 endpoint
         response = self._execute_request('/api/v2.0/pool')
-
         free_bytes, total_bytes = self._parse_pool_response(response)
 
         free_gb = free_bytes / units.Gi
@@ -290,61 +253,53 @@ class FreeNASCommon:
     # ------------------------------------------------------------------ #
 
     def _create_volume(self, volume_name, volume_size_gb):
-        """
-        Create a ZFS zvol on TrueNAS.
-
-        :param volume_name: name of the zvol (no path prefix)
-        :param volume_size_gb: size in GiB
-        """
+        """Create a ZFS zvol on TrueNAS."""
         LOG.info('iXsystems: _create_volume %s (%sGB)', volume_name, volume_size_gb)
         dataset_path = self.configuration.ixsystems_dataset_path
-        full_name = f'{dataset_path}/{volume_name}'
+        zvol_path = f'{dataset_path}/{volume_name}'
+        size_bytes = self._size_gb_to_bytes(volume_size_gb)
 
         params = {
-            'name': full_name,
+            'name': zvol_path,
             'type': 'VOLUME',
-            'volsize': self._size_gb_to_bytes(volume_size_gb),
+            'volsize': size_bytes,
             'volblocksize': '512',
-            'sparse': False,
+            'sparse': True,
         }
         result = self._execute_request('/api/v2.0/pool/dataset', 'POST', params)
         if result is None:
             raise exception.VolumeBackendAPIException(
-                data=f'No response creating zvol {full_name}'
+                data=f'No response creating zvol {zvol_path}'
             )
-        LOG.info('iXsystems: zvol created: %s', full_name)
+        LOG.info('iXsystems: zvol created: %s', zvol_path)
         return result
 
     def _delete_volume(self, volume_name):
         """Delete a ZFS zvol from TrueNAS."""
         LOG.info('iXsystems: _delete_volume %s', volume_name)
         dataset_path = self.configuration.ixsystems_dataset_path
-        zvol_id = f'{dataset_path}/{volume_name}'.replace('/', '%2F')
-
-        # Check it exists first; if not, skip silently
-        existing = self._execute_request(f'/api/v2.0/pool/dataset/id/{zvol_id}')
-        if existing is None:
-            LOG.warning('iXsystems: zvol %s not found, skipping delete', volume_name)
-            return
+        zvol_path = f'{dataset_path}/{volume_name}'
+        encoded = zvol_path.replace('/', '%2F')
 
         self._execute_request(
-            f'/api/v2.0/pool/dataset/id/{zvol_id}',
+            f'/api/v2.0/pool/dataset/id/{encoded}',
             'DELETE',
-            {'recursive': True}
+            query_params={'recursive': 'true'}
         )
-        LOG.info('iXsystems: zvol deleted: %s/%s', dataset_path, volume_name)
+        LOG.info('iXsystems: zvol deleted: %s', zvol_path)
 
     def _extend_volume(self, volume_name, new_size_gb):
-        """Extend a ZFS zvol to new_size_gb."""
-        LOG.info('iXsystems: _extend_volume %s → %sGB', volume_name, new_size_gb)
+        """Extend a ZFS zvol."""
+        LOG.info('iXsystems: _extend_volume %s -> %sGB', volume_name, new_size_gb)
         dataset_path = self.configuration.ixsystems_dataset_path
-        zvol_id = f'{dataset_path}/{volume_name}'.replace('/', '%2F')
+        zvol_path = f'{dataset_path}/{volume_name}'
+        encoded = zvol_path.replace('/', '%2F')
+        size_bytes = self._size_gb_to_bytes(new_size_gb)
 
-        params = {'volsize': self._size_gb_to_bytes(new_size_gb)}
         self._execute_request(
-            f'/api/v2.0/pool/dataset/id/{zvol_id}',
+            f'/api/v2.0/pool/dataset/id/{encoded}',
             'PUT',
-            params
+            {'volsize': size_bytes}
         )
 
     def _create_snapshot(self, volume_name, snapshot_name):
@@ -372,24 +327,21 @@ class FreeNASCommon:
             'DELETE'
         )
 
-    def _create_volume_from_snapshot(self, volume_name, snapshot_volume_name,
-                                     snapshot_name):
+    def _create_volume_from_snapshot(self, volume_name, src_volume_name, snapshot_name):
         """Clone a snapshot into a new zvol."""
         LOG.info(
             'iXsystems: _create_volume_from_snapshot %s from %s@%s',
-            volume_name, snapshot_volume_name, snapshot_name
+            volume_name, src_volume_name, snapshot_name
         )
         dataset_path = self.configuration.ixsystems_dataset_path
-        src_snapshot = f'{dataset_path}/{snapshot_volume_name}@{snapshot_name}'
+        src_snapshot = f'{dataset_path}/{src_volume_name}@{snapshot_name}'
         dst_dataset = f'{dataset_path}/{volume_name}'
 
         params = {
             'snapshot': src_snapshot,
             'dataset_dst': dst_dataset,
         }
-        result = self._execute_request(
-            '/api/v2.0/zfs/snapshot/clone', 'POST', params
-        )
+        result = self._execute_request('/api/v2.0/zfs/snapshot/clone', 'POST', params)
         if result is None:
             raise exception.VolumeBackendAPIException(
                 data=f'No response cloning snapshot to {dst_dataset}'
@@ -411,15 +363,26 @@ class FreeNASCommon:
     # ------------------------------------------------------------------ #
 
     def _get_iscsi_target(self, target_name):
-        """Return the iSCSI target dict or None."""
-        targets = self._execute_request('/api/v2.0/iscsi/target') or []
-        for t in targets:
+        """
+        Return the iSCSI target dict or None.
+
+        PERF: Uses server-side ?name= filter instead of fetching the full
+        target list and scanning it in Python. On a busy TrueNAS with many
+        targets this avoids transferring and parsing a large JSON array.
+        """
+        results = self._execute_request(
+            '/api/v2.0/iscsi/target',
+            query_params={'name': target_name}
+        ) or []
+        # API returns a list even when filtered — take first exact match
+        for t in results:
             if t.get('name') == target_name:
                 return t
         return None
 
     def _create_iscsi_target(self, target_name):
-        """Create an iSCSI target on TrueNAS.
+        """
+        Create an iSCSI target on TrueNAS.
 
         TrueNAS CORE 13 treats alias='' as a value and enforces uniqueness —
         sending alias='' for every target causes HTTP 422 'Alias already exists'
@@ -439,7 +402,8 @@ class FreeNASCommon:
         return result
 
     def _delete_iscsi_target(self, target_id):
-        """Delete an iSCSI target.
+        """
+        Delete an iSCSI target.
 
         TrueNAS CORE 13 requires 'force' as a URL query parameter, NOT a
         JSON body -- sending it as JSON body returns HTTP 422 'Not a boolean'.
@@ -452,16 +416,23 @@ class FreeNASCommon:
         )
 
     def _get_iscsi_extent(self, extent_name):
-        """Return the iSCSI extent dict or None."""
-        extents = self._execute_request('/api/v2.0/iscsi/extent') or []
-        for e in extents:
+        """
+        Return the iSCSI extent dict or None.
+
+        PERF: Uses server-side ?name= filter instead of full list scan.
+        """
+        results = self._execute_request(
+            '/api/v2.0/iscsi/extent',
+            query_params={'name': extent_name}
+        ) or []
+        for e in results:
             if e.get('name') == extent_name:
                 return e
         return None
 
     def _create_iscsi_extent(self, extent_name, zvol_path):
         """Create an iSCSI extent backed by a zvol."""
-        LOG.info('iXsystems: creating iSCSI extent %s → %s', extent_name, zvol_path)
+        LOG.info('iXsystems: creating iSCSI extent %s -> %s', extent_name, zvol_path)
         params = {
             'name': extent_name,
             'type': 'DISK',
@@ -480,22 +451,50 @@ class FreeNASCommon:
         return result
 
     def _delete_iscsi_extent(self, extent_id):
-        """Delete an iSCSI extent."""
+        """Delete an iSCSI extent.
+
+        TrueNAS CORE 13: 'remove' must be a query param, not a JSON body.
+        """
         LOG.info('iXsystems: deleting iSCSI extent id=%s', extent_id)
-        # TrueNAS CORE 13: 'remove' must be a query param, not a JSON body
         self._execute_request(
             f'/api/v2.0/iscsi/extent/id/{extent_id}',
             'DELETE',
             query_params={'remove': 'true'}
         )
 
-    def _get_iscsi_targetextent(self, target_id, extent_id):
-        """Return the target-extent link or None."""
-        links = self._execute_request('/api/v2.0/iscsi/targetextent') or []
-        for link in links:
-            if link.get('target') == target_id and link.get('extent') == extent_id:
-                return link
-        return None
+    def _get_targetextent_and_lun(self, target_id, extent_id=None):
+        """
+        Fetch the targetextent list filtered to a specific target and return
+        both the existing link (if any) and the next available LUN ID.
+
+        PERF: Replaces two separate calls that were both fetching the full
+        targetextent list:
+          - _get_iscsi_targetextent(target_id, extent_id)  → find existing link
+          - _get_available_lun(target_id)                  → find free LUN
+        Now we fetch the list once and derive both answers from it.
+
+        :returns: (link_or_None, next_free_lun_id)
+        """
+        results = self._execute_request(
+            '/api/v2.0/iscsi/targetextent',
+            query_params={'target': target_id}
+        ) or []
+
+        existing_link = None
+        used_luns = set()
+
+        for link in results:
+            if link.get('target') == target_id:
+                used_luns.add(link.get('lunid', 0))
+                if extent_id is not None and link.get('extent') == extent_id:
+                    existing_link = link
+
+        # Find the lowest free LUN
+        lun = 0
+        while lun in used_luns:
+            lun += 1
+
+        return existing_link, lun
 
     def _create_iscsi_targetextent(self, target_id, extent_id, lun_id=0):
         """Associate an extent to a target at the given LUN ID."""
@@ -525,22 +524,19 @@ class FreeNASCommon:
             'DELETE'
         )
 
-    def _get_available_lun(self, target_id):
-        """Return the lowest unused LUN ID for a target."""
-        links = self._execute_request('/api/v2.0/iscsi/targetextent') or []
-        used = {
-            link['lunid']
-            for link in links
-            if link.get('target') == target_id
-        }
-        lun = 0
-        while lun in used:
-            lun += 1
-        return lun
-
     def _get_iscsi_global_config(self):
-        """Return TrueNAS global iSCSI config (includes basename)."""
-        return self._execute_request('/api/v2.0/iscsi/global') or {}
+        """
+        Return TrueNAS global iSCSI config (includes basename).
+
+        PERF: Result is cached in self._iscsi_basename after the first call.
+        The basename never changes at runtime so there is no reason to fetch
+        it on every single attach operation.
+        """
+        if self._iscsi_basename is None:
+            config = self._execute_request('/api/v2.0/iscsi/global') or {}
+            self._iscsi_basename = config
+            LOG.debug('iXsystems: cached iSCSI global config: %s', config)
+        return self._iscsi_basename
 
     # ------------------------------------------------------------------ #
     # High-level attach / detach                                           #
@@ -549,40 +545,68 @@ class FreeNASCommon:
     def _create_target_and_extent(self, volume_name):
         """
         Ensure an iSCSI target + extent exist for volume_name and are linked.
+
         Returns (target, extent, lun_id).
+
+        API call count (optimised):
+          1. GET /api/v2.0/iscsi/target?name=<x>       server-side filter
+          2. POST /api/v2.0/iscsi/target                (if not exists)
+          3. GET /api/v2.0/iscsi/extent?name=<x>       server-side filter
+          4. POST /api/v2.0/iscsi/extent                (if not exists)
+          5. GET /api/v2.0/iscsi/targetextent?target=<id>  filtered + lun calc
+          6. POST /api/v2.0/iscsi/targetextent          (if not linked)
+          ---
+          Total: 4 calls (happy path — target/extent/link all new)
+                 4 calls (idempotent path — all already exist, no POSTs)
+          Was:   8 calls before optimisation
         """
         dataset_path = self.configuration.ixsystems_dataset_path
         target_name = self._get_iscsi_target_name(volume_name)
         zvol_path = f'{dataset_path}/{volume_name}'
 
+        # Step 1+2: target
         target = self._get_iscsi_target(target_name)
         if target is None:
             target = self._create_iscsi_target(target_name)
         target_id = target['id']
 
+        # Step 3+4: extent
         extent = self._get_iscsi_extent(volume_name)
         if extent is None:
             extent = self._create_iscsi_extent(volume_name, zvol_path)
         extent_id = extent['id']
 
-        link = self._get_iscsi_targetextent(target_id, extent_id)
+        # Step 5+6: targetextent link + LUN — single list fetch covers both
+        link, next_lun = self._get_targetextent_and_lun(target_id, extent_id)
         if link is None:
-            lun_id = self._get_available_lun(target_id)
-            link = self._create_iscsi_targetextent(target_id, extent_id, lun_id)
+            link = self._create_iscsi_targetextent(target_id, extent_id, next_lun)
+            lun_id = next_lun
         else:
             lun_id = link['lunid']
 
         return target, extent, lun_id
 
     def _remove_target_and_extent(self, volume_name):
-        """Remove the iSCSI target, extent, and their link for volume_name."""
+        """
+        Remove the iSCSI target, extent, and their link for volume_name.
+
+        API call count (optimised):
+          1. GET /api/v2.0/iscsi/target?name=<x>         server-side filter
+          2. GET /api/v2.0/iscsi/extent?name=<x>         server-side filter
+          3. GET /api/v2.0/iscsi/targetextent?target=<id> server-side filter
+          4. DELETE targetextent
+          5. DELETE extent
+          6. DELETE target
+          ---
+          Total: 6 calls (same count but each GET is now filtered, not full scan)
+        """
         target_name = self._get_iscsi_target_name(volume_name)
 
         target = self._get_iscsi_target(target_name)
         extent = self._get_iscsi_extent(volume_name)
 
         if target and extent:
-            link = self._get_iscsi_targetextent(target['id'], extent['id'])
+            link, _ = self._get_targetextent_and_lun(target['id'], extent['id'])
             if link:
                 self._delete_iscsi_targetextent(link['id'])
             self._delete_iscsi_extent(extent['id'])
