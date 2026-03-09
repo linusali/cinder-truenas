@@ -34,6 +34,7 @@
 
 import json
 import math
+import urllib.parse
 
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -318,17 +319,34 @@ class FreeNASCommon:
         return result
 
     def _delete_snapshot(self, volume_name, snapshot_name):
-        """Delete a ZFS snapshot."""
+        """Delete a ZFS snapshot.
+
+        TrueNAS API v2.0 snapshot IDs are the full ZFS snapshot path with
+        ALL special characters percent-encoded — including the '@' separator
+        between dataset name and snapshot name.
+
+        Wrong (old): ocp-pool%2Fvols%2Fcinder%2Fvolume-abc@snapshot-xyz
+                     ← '@' not encoded, TrueNAS returns 404
+        Correct:     ocp-pool%2Fvols%2Fcinder%2Fvolume-abc%40snapshot-xyz
+                     ← full urllib.parse.quote encoding
+        """
         LOG.info('iXsystems: _delete_snapshot %s@%s', volume_name, snapshot_name)
         dataset_path = self.configuration.ixsystems_dataset_path
-        snap_id = f'{dataset_path}/{volume_name}@{snapshot_name}'.replace('/', '%2F')
+        full_snap = f'{dataset_path}/{volume_name}@{snapshot_name}'
+        # Must encode ALL special chars including '/' and '@'
+        snap_id = urllib.parse.quote(full_snap, safe='')
         self._execute_request(
             f'/api/v2.0/zfs/snapshot/id/{snap_id}',
             'DELETE'
         )
 
     def _create_volume_from_snapshot(self, volume_name, src_volume_name, snapshot_name):
-        """Clone a snapshot into a new zvol."""
+        """Clone a snapshot into a new zvol.
+
+        The 'snapshot' field in the clone API takes the unencoded full ZFS
+        snapshot path (pool/dataset@snapname) — this is a POST body field,
+        not a URL path segment, so no percent-encoding needed here.
+        """
         LOG.info(
             'iXsystems: _create_volume_from_snapshot %s from %s@%s',
             volume_name, src_volume_name, snapshot_name
@@ -349,14 +367,35 @@ class FreeNASCommon:
         return result
 
     def _create_cloned_volume(self, volume_name, src_volume_name, volume_size_gb):
-        """Clone a volume by snapshotting it then cloning the snapshot."""
+        """Clone a volume by snapshotting it then cloning the snapshot.
+
+        The temporary snapshot created here is cleaned up immediately after
+        the clone succeeds. Previously it was never deleted, causing orphaned
+        snapshots to accumulate on TrueNAS for every cloned volume.
+        """
         LOG.info(
             'iXsystems: _create_cloned_volume %s from %s',
             volume_name, src_volume_name
         )
         temp_snapshot = f'clone-tmp-{volume_name}'
         self._create_snapshot(src_volume_name, temp_snapshot)
-        self._create_volume_from_snapshot(volume_name, src_volume_name, temp_snapshot)
+        try:
+            self._create_volume_from_snapshot(volume_name, src_volume_name, temp_snapshot)
+        finally:
+            # Always clean up the temp snapshot — even if the clone failed.
+            # On failure this leaves TrueNAS in a clean state for retry.
+            try:
+                self._delete_snapshot(src_volume_name, temp_snapshot)
+                LOG.debug(
+                    'iXsystems: cleaned up temp snapshot %s@%s',
+                    src_volume_name, temp_snapshot
+                )
+            except Exception as e:
+                # Non-fatal — log and move on. The clone result is what matters.
+                LOG.warning(
+                    'iXsystems: failed to delete temp snapshot %s@%s: %s',
+                    src_volume_name, temp_snapshot, e
+                )
 
     # ------------------------------------------------------------------ #
     # iSCSI target management                                              #
