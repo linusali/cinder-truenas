@@ -149,23 +149,8 @@ class FreeNASCommon:
         """Convert byte value to GiB, rounding up."""
         return math.ceil(size_bytes / units.Gi)
 
-    def _size_gb_to_str(self, size_gb):
-        """
-        Convert a Cinder GB size to a TrueNAS API volsize string.
-
-        TrueNAS CORE 13 API v2.0 has a 32-bit integer overflow bug when
-        volsize is passed as raw bytes — any volume >= 4 GiB overflows and
-        gets silently created as ~1 GiB instead.
-
-        Passing volsize as a string e.g. '10G' bypasses the overflow entirely
-        since TrueNAS parses the string internally with 64-bit arithmetic.
-
-        Cinder volume.size is in SI gigabytes (10^9), so we use 'G' suffix.
-        """
-        return f'{size_gb}G'
-
     def _size_gb_to_bytes(self, size_gb):
-        """Convert GB to bytes — used only for capacity reporting math."""
+        """Convert GiB to bytes for volsize and capacity math."""
         return size_gb * units.Gi
 
     # ------------------------------------------------------------------ #
@@ -273,12 +258,12 @@ class FreeNASCommon:
         LOG.info('iXsystems: _create_volume %s (%sGB)', volume_name, volume_size_gb)
         dataset_path = self.configuration.ixsystems_dataset_path
         zvol_path = f'{dataset_path}/{volume_name}'
-        volsize_str = self._size_gb_to_str(volume_size_gb)
+        size_bytes = self._size_gb_to_bytes(volume_size_gb)
 
         params = {
             'name': zvol_path,
             'type': 'VOLUME',
-            'volsize': volsize_str,   # string avoids 32-bit overflow in TrueNAS CORE 13
+            'volsize': size_bytes,
             'volblocksize': '512',
             'sparse': True,
         }
@@ -310,12 +295,12 @@ class FreeNASCommon:
         dataset_path = self.configuration.ixsystems_dataset_path
         zvol_path = f'{dataset_path}/{volume_name}'
         encoded = zvol_path.replace('/', '%2F')
-        volsize_str = self._size_gb_to_str(new_size_gb)
+        size_bytes = self._size_gb_to_bytes(new_size_gb)
 
         self._execute_request(
             f'/api/v2.0/pool/dataset/id/{encoded}',
             'PUT',
-            {'volsize': volsize_str}   # string avoids 32-bit overflow in TrueNAS CORE 13
+            {'volsize': size_bytes}
         )
 
     def _create_snapshot(self, volume_name, snapshot_name):
