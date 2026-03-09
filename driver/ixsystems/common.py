@@ -141,9 +141,19 @@ class FreeNASCommon:
             ) from e
 
     def _get_iscsi_target_name(self, volume_name):
-        """Build the iSCSI target name for a given volume."""
-        iqn_prefix = self.configuration.ixsystems_iqn_prefix.rstrip(':')
-        return f'{iqn_prefix}:{volume_name}'
+        """
+        Return the short target name used in TrueNAS API calls.
+
+        TrueNAS CORE 13 stores targets by their short name only (e.g.
+        'volume-abc123') in the iSCSI target 'name' field.  The full IQN
+        (iqn.2005-10.org.freenas.ctl:volume-abc123) is assembled by ctld at
+        runtime by prepending the global basename.  Passing the full IQN as
+        the target name causes the API to either reject it or store a broken
+        double-prefixed name like:
+            iqn…ctl:iqn…ctl:volume-abc123
+        which ctld never advertises, so the initiator can never find it.
+        """
+        return volume_name
 
     def _size_bytes_to_gb(self, size_bytes):
         """Convert byte value to GiB, rounding up."""

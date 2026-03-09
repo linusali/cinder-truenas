@@ -159,13 +159,15 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
 
         target, extent, lun_id = self.common._create_target_and_extent(volume.name)
 
+        # Build full IQN: basename + short volume name.
+        # _get_iscsi_target_name() returns the short name only (volume.name).
+        # TrueNAS stores targets by short name; ctld prepends the global
+        # basename at runtime. We reconstruct the full IQN here for Nova/os-brick.
         global_config = self.common._get_iscsi_global_config()
         basename = global_config.get(
             'basename', self.configuration.ixsystems_iqn_prefix
-        )
-        target_name = self.common._get_iscsi_target_name(volume.name)
-        iqn = target_name if basename.rstrip(':') in target_name \
-            else f'{basename.rstrip(":")}:{target_name}'
+        ).rstrip(':')
+        iqn = f'{basename}:{volume.name}'
 
         portal = f'{self.configuration.ixsystems_server_hostname}:3260'
 
@@ -176,7 +178,6 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
             'volume_id': volume.id,
             'target_lun': lun_id,
             'access_mode': 'rw',
-            'shared_targets': True,
         }
 
         LOG.info('iXsystems: connection properties for %s: iqn=%s portal=%s lun=%s',
