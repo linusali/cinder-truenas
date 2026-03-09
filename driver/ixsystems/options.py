@@ -90,4 +90,21 @@ ixsystems_opts = [
         help='Whether to verify the TrueNAS SSL certificate. '
              'Set True in production with a valid cert.',
     ),
+    cfg.IntOpt(
+        'ixsystems_portal_group_id',
+        default=1,
+        help='TrueNAS iSCSI portal group ID to assign to new targets. '
+             'TrueNAS CORE will not open port 3260 until at least one target '
+             'has a portal group assigned. Find the ID at: '
+             'TrueNAS UI -> Sharing -> Block iSCSI -> Portals. '
+             'Default is 1 (the out-of-the-box default portal group).',
+    ),
+    cfg.IntOpt(
+        'ixsystems_initiator_group_id',
+        default=None,
+        help='TrueNAS iSCSI initiator group ID to assign to new targets. '
+             'If set, restricts which initiators can connect. '
+             'Leave unset (None) to allow all initiators (open access). '
+             'Find the ID at: TrueNAS UI -> Sharing -> Block iSCSI -> Initiators.',
+    ),
 ]

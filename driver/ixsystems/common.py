@@ -431,18 +431,37 @@ class FreeNASCommon:
 
     def _create_iscsi_target(self, target_name):
         """
-        Create an iSCSI target on TrueNAS.
+        Create an iSCSI target on TrueNAS and assign it to a portal group.
+
+        TrueNAS CORE 13 will NOT open port 3260 / start ctld listening until
+        at least one target has a portal group assigned.  Passing groups=[]
+        creates the target object but leaves port 3260 closed — every
+        subsequent iscsiadm discovery attempt returns "Connection refused".
+
+        The portal group ID comes from ixsystems_portal_group_id (default=1).
+        If ixsystems_initiator_group_id is set, that initiator group is also
+        attached (restricts which initiators may connect); if unset, the group
+        entry is omitted so TrueNAS uses open access (all initiators allowed).
 
         TrueNAS CORE 13 treats alias='' as a value and enforces uniqueness —
         sending alias='' for every target causes HTTP 422 'Alias already exists'
         after the first target. Omit alias entirely so TrueNAS assigns null.
         """
         LOG.info('iXsystems: creating iSCSI target %s', target_name)
+
+        portal_group_id = self.configuration.ixsystems_portal_group_id
+        initiator_group_id = self.configuration.ixsystems_initiator_group_id
+
+        group_entry = {'portal': portal_group_id}
+        if initiator_group_id is not None:
+            group_entry['initiator'] = initiator_group_id
+
         params = {
             'name': target_name,
             'mode': 'ISCSI',
-            'groups': [],
+            'groups': [group_entry],
         }
+        LOG.debug('iXsystems: target groups payload: %s', params['groups'])
         result = self._execute_request('/api/v2.0/iscsi/target', 'POST', params)
         if result is None:
             raise exception.VolumeBackendAPIException(
