@@ -351,11 +351,18 @@ class FreeNASCommon:
         )
 
     def _create_volume_from_snapshot(self, volume_name, src_volume_name, snapshot_name):
-        """Clone a snapshot into a new zvol.
+        """Clone a snapshot into a new zvol, then promote it.
 
         The 'snapshot' field in the clone API takes the unencoded full ZFS
         snapshot path (pool/dataset@snapname) — this is a POST body field,
         not a URL path segment, so no percent-encoding needed here.
+
+        After cloning we immediately promote the new zvol.  Without promotion
+        the clone retains a ZFS dependency on the source snapshot, which
+        prevents the snapshot from ever being deleted:
+            "Cannot destroy …@snapshot-…: snapshot has dependent clones"
+        Promotion reverses the parent/child relationship so the clone becomes
+        a fully independent zvol and the snapshot reference is severed.
         """
         LOG.info(
             'iXsystems: _create_volume_from_snapshot %s from %s@%s',
@@ -374,7 +381,37 @@ class FreeNASCommon:
             raise exception.VolumeBackendAPIException(
                 data=f'No response cloning snapshot to {dst_dataset}'
             )
+
+        # Promote immediately to sever the ZFS dependency on the source snapshot.
+        self._promote_dataset(dst_dataset)
+
         return result
+
+    def _promote_dataset(self, dataset_path):
+        """Promote a ZFS clone so it no longer depends on its origin snapshot.
+
+        TrueNAS CORE 13 API: POST /api/v2.0/zfs/dataset/promote
+        Body: the dataset path as a plain string (not a dict).
+
+        After promotion the clone is a fully independent zvol.  Its former
+        parent can be snapshotted, cloned, or deleted without restriction.
+        Failure here is logged as a warning rather than an exception — the
+        volume itself was created successfully; the only consequence of a
+        failed promote is that the source snapshot cannot be deleted while
+        this clone exists (the pre-existing behaviour).
+        """
+        LOG.info('iXsystems: promoting dataset %s', dataset_path)
+        result = self._execute_request(
+            '/api/v2.0/zfs/dataset/promote', 'POST', dataset_path
+        )
+        if result is None:
+            LOG.warning(
+                'iXsystems: promote returned no response for %s — '
+                'snapshot deletion may be blocked until this volume is removed',
+                dataset_path
+            )
+        else:
+            LOG.info('iXsystems: promoted %s successfully', dataset_path)
 
     def _create_cloned_volume(self, volume_name, src_volume_name, volume_size_gb):
         """Clone a volume by snapshotting it then cloning the snapshot.
@@ -667,24 +704,45 @@ class FreeNASCommon:
           6. DELETE target
           ---
           Total: 6 calls (same count but each GET is now filtered, not full scan)
+
+        Multi-attach / in-use handling:
+          Cinder removes the DB attachment record before calling
+          terminate_connection, so volume.volume_attachment may already show
+          zero remaining attachments even when other VMs still have live iSCSI
+          sessions.  TrueNAS will return HTTP 422 "target … is in use" if we
+          try to delete while sessions exist.  We treat this as a non-fatal
+          warning — the target/extent stays intact for the remaining sessions
+          and will be cleaned up on the next detach or on volume deletion.
         """
         target_name = self._get_iscsi_target_name(volume_name)
 
         target = self._get_iscsi_target(target_name)
         extent = self._get_iscsi_extent(volume_name)
 
-        if target and extent:
-            link, _ = self._get_targetextent_and_lun(target['id'], extent['id'])
-            if link:
-                self._delete_iscsi_targetextent(link['id'])
-            self._delete_iscsi_extent(extent['id'])
-            self._delete_iscsi_target(target['id'])
-        elif target:
-            self._delete_iscsi_target(target['id'])
-        elif extent:
-            self._delete_iscsi_extent(extent['id'])
-        else:
-            LOG.warning(
-                'iXsystems: no target or extent found for %s on detach',
-                volume_name
-            )
+        try:
+            if target and extent:
+                link, _ = self._get_targetextent_and_lun(target['id'], extent['id'])
+                if link:
+                    self._delete_iscsi_targetextent(link['id'])
+                self._delete_iscsi_extent(extent['id'])
+                self._delete_iscsi_target(target['id'])
+            elif target:
+                self._delete_iscsi_target(target['id'])
+            elif extent:
+                self._delete_iscsi_extent(extent['id'])
+            else:
+                LOG.warning(
+                    'iXsystems: no target or extent found for %s on detach',
+                    volume_name
+                )
+        except exception.VolumeBackendAPIException as e:
+            err = str(e)
+            if 'in use' in err.lower() or '422' in err:
+                LOG.warning(
+                    'iXsystems: target for %s is still in use (active iSCSI '
+                    'session from another host) — keeping target intact. '
+                    'It will be removed on the final detach or volume deletion. '
+                    'Detail: %s', volume_name, err
+                )
+            else:
+                raise
