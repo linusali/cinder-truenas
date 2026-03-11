@@ -110,7 +110,9 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
     def create_cloned_volume(self, volume, src_vref):
         LOG.info('iXsystems: create_cloned_volume %s from %s',
                  volume.name, src_vref.name)
-        self.common._create_cloned_volume(volume.name, src_vref.name, volume.size)
+        self.common._create_cloned_volume(
+            volume.name, src_vref.name, volume.size, src_vref.size
+        )
 
     # ------------------------------------------------------------------ #
     # Export methods — required by Cinder ISCSIDriver base class          #
@@ -248,7 +250,8 @@ class FreeNASISCSIDriver(driver.ISCSIDriver):
     # ------------------------------------------------------------------ #
 
     def get_volume_stats(self, refresh=False):
-        LOG.info('iXsystems Get Volume Status')
         self._init_common()
-        self.stats = self.common._update_volume_stats()
-        return self.stats
+        if refresh or not self.common.stats:
+            LOG.info('iXsystems Get Volume Status')
+            self.stats = self.common._update_volume_stats()
+        return self.common.stats
