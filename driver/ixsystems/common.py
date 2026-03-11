@@ -70,7 +70,7 @@ class FreeNASCommon:
     def __init__(self, configuration):
         self.configuration = configuration
         self.configuration.append_config_values(options.ixsystems_opts)
-        self._stats = {}
+        self.stats = {}
         self.handle = None
         # Cached iSCSI global basename — fetched once, never changes at runtime
         self._iscsi_basename = None
@@ -401,9 +401,17 @@ class FreeNASCommon:
         this clone exists (the pre-existing behaviour).
         """
         LOG.info('iXsystems: promoting dataset %s', dataset_path)
-        result = self._execute_request(
-            '/api/v2.0/zfs/dataset/promote', 'POST', dataset_path
-        )
+        try:
+            result = self._execute_request(
+                '/api/v2.0/zfs/dataset/promote', 'POST', dataset_path
+            )
+        except Exception as e:
+            LOG.warning(
+                'iXsystems: promote failed for %s: %s — '
+                'snapshot deletion may be blocked until this volume is removed',
+                dataset_path, e
+            )
+            return
         if result is None:
             LOG.warning(
                 'iXsystems: promote returned no response for %s — '
@@ -413,16 +421,20 @@ class FreeNASCommon:
         else:
             LOG.info('iXsystems: promoted %s successfully', dataset_path)
 
-    def _create_cloned_volume(self, volume_name, src_volume_name, volume_size_gb):
+    def _create_cloned_volume(self, volume_name, src_volume_name, volume_size_gb,
+                              src_size_gb=None):
         """Clone a volume by snapshotting it then cloning the snapshot.
 
         The temporary snapshot created here is cleaned up immediately after
         the clone succeeds. Previously it was never deleted, causing orphaned
         snapshots to accumulate on TrueNAS for every cloned volume.
+
+        If volume_size_gb > src_size_gb the clone is extended after promotion
+        so the resulting zvol matches the requested Cinder volume size.
         """
         LOG.info(
-            'iXsystems: _create_cloned_volume %s from %s',
-            volume_name, src_volume_name
+            'iXsystems: _create_cloned_volume %s from %s (%sGB -> %sGB)',
+            volume_name, src_volume_name, src_size_gb, volume_size_gb
         )
         temp_snapshot = f'clone-tmp-{volume_name}'
         self._create_snapshot(src_volume_name, temp_snapshot)
@@ -443,6 +455,16 @@ class FreeNASCommon:
                     'iXsystems: failed to delete temp snapshot %s@%s: %s',
                     src_volume_name, temp_snapshot, e
                 )
+
+        # Extend the clone if the requested size is larger than the source.
+        # ZFS clones inherit the source zvol size; Cinder may request a larger
+        # target (e.g. when a volume type has a minimum size constraint).
+        if src_size_gb is None or volume_size_gb > src_size_gb:
+            LOG.info(
+                'iXsystems: extending clone %s to %sGB (source was %sGB)',
+                volume_name, volume_size_gb, src_size_gb
+            )
+            self._extend_volume(volume_name, volume_size_gb)
 
     # ------------------------------------------------------------------ #
     # iSCSI target management                                              #
